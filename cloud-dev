@@ -1,0 +1,211 @@
+#!/bin/sh
+set -e
+
+PROGRAM_NAME=$0
+BASEDIR=$(dirname "$0")
+
+INSTANCE_TYPE="n1-standard-8"
+INSTANCE_IMAGE="debian-10"
+INSTANCE_IMAGE_PROJECT="debian-cloud"
+INSTANCE_STATIC_ADDRESS_NAME="cloud-development"
+INSTANCE_NAME="cloud-development"
+INSTANCE_TAG="cloud-development"
+INSTANCE_STARTUP_SCRIPT="$BASEDIR/scripts/startup.sh"
+INSTANCE_ADDRESS=""
+
+SSL_CERT=""
+SSL_KEY=""
+
+CREATE_INSTANCE="false"
+DELETE_INSTANCE="false"
+ACCESS_INSTANCE="false"
+
+PROJECTOR=".local/bin/projector"
+PROJECTOR_PORT="9999"
+PROJECTOR_CONFIG=""
+
+exit_code=0
+
+info() {
+    echo '[INFO] ' "$@"
+}
+warn() {
+    echo '[WARN] ' "$@" >&2
+}
+fatal() {
+    echo '[ERROR] ' "$@" >&2
+    exit 1
+}
+
+usage() {
+    echo "usage: $PROGRAM_NAME <config>"
+    echo "\t--help | -h                 Print this help"
+    echo "\t--instance | -i <name>      Name of the instance (default: $INSTANCE_NAME)"
+    echo "\t--create | -c               Create the instance"
+    echo "\t--address | -a <name>       Name of the static address, use with --create (default: $INSTANCE_STATIC_ADDRESS_NAME)"
+    echo "\t--cert <path>               Path to the cert (required with --create | -c)"
+    echo "\t--key <path>                Path to the key file (required with --create | -c)"
+    echo "\t--delete | -d               Delete the instance"
+    echo "\t--ssh                       SSH to the instance"
+    echo "\t<config>                    Projector config to run"
+    exit 1
+}
+
+parse_params() {
+    while [[ -n "$1" ]]; do
+        param="$1"
+        value="$2"
+        case $param in
+        -h | --help)
+            usage
+            exit
+            ;;
+        --instance | -i)
+            INSTANCE_NAME="$value"
+            shift 2
+            ;;
+        --create | -c)
+            CREATE_INSTANCE="true"
+            shift 1
+            ;;
+        --address | -a)
+            INSTANCE_STATIC_ADDRESS_NAME="$value"
+            shift 2
+            ;;
+        --cert)
+            SSL_CERT="$value"
+            shift 2
+            ;;
+        --key)
+            SSL_KEY="$value"
+            shift 2
+            ;;
+        --delete | -d)
+            DELETE_INSTANCE="true"
+            shift 1
+            ;;
+        --ssh)
+            ACCESS_INSTANCE="true"
+            shift 1
+            ;;
+        *)
+            PROJECTOR_CONFIG="$param"
+            shift 1
+            ;;
+        esac
+    done
+}
+
+delete_instance() {
+    info "Deleting $INSTANCE_NAME"
+    gcloud compute instances delete "$INSTANCE_NAME"
+}
+
+stop_instance() {
+    info "Stopping $INSTANCE_NAME"
+    gcloud compute instances stop "$INSTANCE_NAME" --async
+}
+
+start_instance() {
+    info "Starting $INSTANCE_NAME"
+    gcloud compute instances start "$INSTANCE_NAME"
+}
+
+run_projector() {
+    set -m
+    gcloud compute ssh "root@$INSTANCE_NAME" -- "$PROJECTOR run $PROJECTOR_CONFIG" & pid=$!
+    info "Opening navigator"
+    projector_address="https://$INSTANCE_ADDRESS:$PROJECTOR_PORT/?host=$INSTANCE_ADDRESS&port=$PROJECTOR_PORT"
+    open -nWa "Google Chrome" --args --app="$projector_address"
+    fg
+    set +m
+}
+
+access_instance() {
+    gcloud compute ssh "root@$INSTANCE_NAME"
+}
+
+create_instance() {
+    info "Creating $INSTANCE_NAME"
+    if [[ -z "$SSL_CERT" ]]; then
+        fatal "Missing path to cert file (--cert <path>)"
+    fi
+    if [[ -z "$SSL_KEY" ]]; then
+        fatal "Missing path to key file (--key <path>)"
+    fi
+    # TODO create the instance
+    gcloud compute instances create "$INSTANCE_NAME" \
+        --image-family "$INSTANCE_IMAGE" \
+        --image-project "$INSTANCE_IMAGE_PROJECT" \
+        --machine-type "$INSTANCE_TYPE" \
+        --tags="$INSTANCE_TAG" \
+        --address="$INSTANCE_ADDRESS" \
+        --metadata-from-file startup-script="$INSTANCE_STARTUP_SCRIPT"
+    sleep 10
+    gcloud compute instances delete-access-config "$INSTANCE_NAME" \
+        --access-config-name "external-nat"
+    gcloud compute instances add-access-config "$INSTANCE_NAME" \
+        --access-config-name "external-nat" --address "$INSTANCE_ADDRESS"
+    gcloud compute scp "$SSL_CERT" "root@$INSTANCE_NAME:~"
+    gcloud compute scp "$SSL_KEY" "root@$INSTANCE_NAME:~"
+    access_instance
+}
+
+load_static_address() {
+    info "Fetching instance address"
+    INSTANCE_ADDRESS="$(gcloud compute addresses describe $INSTANCE_STATIC_ADDRESS_NAME --format='get(address)')"
+    if [[ -z "$INSTANCE_ADDRESS" ]]; then
+        fatal "Create static address $INSTANCE_STATIC_ADDRESS_NAME (see https://cloud.google.com/compute/docs/ip-addresses/reserve-static-external-ip-address)"
+    fi
+}
+
+setup_firewall() {
+    command="create"
+    if [[ $(gcloud compute firewall-rules describe "$INSTANCE_NAME-rule") ]]; then
+        command="update"
+    else
+        command="create"
+    fi
+    ip=$(curl ifconfig.me --silent)
+    gcloud compute firewall-rules "$command" "$INSTANCE_NAME-rule" \
+        --allow tcp:9999 \
+        --source-ranges="$ip" \
+        --target-tags "$INSTANCE_TAG" \
+        --description="Open access to projector"
+}
+
+setup_env() {
+    # TODO
+    export CLOUDSDK_COMPUTE_REGION="europe-west1"
+    export CLOUDSDK_COMPUTE_ZONE="europe-west1-b"
+    load_static_address
+}
+
+cleanup() {
+    trap - EXIT ERR INT TERM
+    if [[ "$DELETE_INSTANCE" == "false" ]]; then
+        stop_instance
+    fi
+}
+
+{
+    trap cleanup EXIT ERR INT TERM
+    PARAMS=$@
+    parse_params $PARAMS
+
+    setup_env
+    if [[ "$DELETE_INSTANCE" == "true" ]]; then
+        delete_instance
+    elif [[ "$ACCESS_INSTANCE" == "true" ]]; then
+        start_instance
+        sleep 10
+        access_instance
+    elif [[ "$CREATE_INSTANCE" == "true" ]]; then
+        create_instance
+    else
+        setup_firewall
+        start_instance
+        sleep 10
+        run_projector
+    fi
+}
